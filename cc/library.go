@@ -1917,7 +1917,7 @@ func (library *libraryDecorator) install(ctx ModuleContext, file android.Path) {
 		CtxIsForPlatform(ctx) && !ctx.isPreventInstall() {
 		installPath := getUnversionedLibraryInstallPath(ctx).Join(ctx, file.Base())
 
-		ctx.Build(pctx, android.BuildParams{
+		ctx.ModuleBuild(pctx, android.ModuleBuildParams{
 			Rule:        android.Cp,
 			Description: "install " + installPath.Base(),
 			Output:      installPath,
