@@ -198,7 +198,10 @@ type ModuleContext interface {
 	InstallInSanitizerDir() bool
 	InstallInRamdisk() bool
 	InstallInVendorRamdisk() bool
+	InstallPathSkipFirstStageRamdisk() bool
+	InstallInVendorKernelRamdisk() bool
 	InstallInDebugRamdisk() bool
+	InstallInTestHarnessRamdisk() bool
 	InstallInRecovery() bool
 	InstallInRoot() bool
 	InstallInOdm() bool
@@ -290,10 +293,10 @@ type ModuleContext interface {
 	// to build the suite.
 	SetTestSuiteInfo(info TestSuiteInfo)
 
-	// FreeModuleAfterGenerateBuildActions marks this module as no longer necessary after the completion of
-	// GenerateBuildActions, i.e. all later accesses to the module will be via ModuleProxy and not direct access
-	// to the Module.
-	FreeModuleAfterGenerateBuildActions()
+	// ModulePhonyFiles registers the srcPaths as dependencies of the module name phony target.
+	// This is similar to OutputFiles, but can be used for files that are not intended to be
+	// consumed by other modules. These files are built as part of checkbuild.
+	ModulePhonyFiles(srcPaths ...Path)
 }
 
 type moduleContext struct {
@@ -302,6 +305,7 @@ type moduleContext struct {
 	packagingSpecs   []PackagingSpec
 	installFiles     InstallPaths
 	checkbuildFiles  Paths
+	modulePhonyFiles Paths
 	checkbuildTarget Path
 	uncheckedModule  bool
 	module           Module
@@ -362,14 +366,14 @@ var _ ModuleContext = &moduleContext{}
 
 func (m *moduleContext) ninjaError(params BuildParams, err error) (PackageContext, BuildParams) {
 	return pctx, BuildParams{
-		Rule:            ErrorRule,
+		Rule:            errorRule,
 		Description:     params.Description,
 		Output:          params.Output,
 		Outputs:         params.Outputs,
 		ImplicitOutput:  params.ImplicitOutput,
 		ImplicitOutputs: params.ImplicitOutputs,
 		Args: map[string]string{
-			"error": err.Error(),
+			"error": proptools.NinjaAndShellEscape(err.Error()),
 		},
 	}
 }
@@ -439,8 +443,8 @@ func (m *moduleContext) Rule(pctx PackageContext, name string, params blueprint.
 
 	if m.config.UseRemoteBuild() {
 		if params.Pool == nil {
-			// When USE_RBE=true is set and the rule is not supported by RBE, restrict
-			// jobs to the local parallelism value
+			// When USE_REWRAPPER=true is set and the rule is not supported by RBE,
+			// restrict jobs to the local parallelism value
 			params.Pool = localPool
 		} else if params.Pool == remotePool {
 			// remotePool is a fake pool used to identify rule that are supported for remoting. If the rule's
@@ -497,18 +501,6 @@ func (m *moduleContext) GetMissingDependencies() []string {
 	return missingDeps
 }
 
-func (m *moduleContext) GetDirectDepWithTag(name string, tag blueprint.DependencyTag) Module {
-	deps := m.getDirectDepsInternal(name, tag)
-	if len(deps) == 1 {
-		return deps[0]
-	} else if len(deps) >= 2 {
-		panic(fmt.Errorf("Multiple dependencies having same BaseModuleName() %q found from %q",
-			name, m.ModuleName()))
-	} else {
-		return nil
-	}
-}
-
 func (m *moduleContext) GetDirectDepProxyWithTag(name string, tag blueprint.DependencyTag) ModuleProxy {
 	deps := m.getDirectDepsProxyInternal(name, tag)
 	if len(deps) == 1 {
@@ -545,8 +537,20 @@ func (m *moduleContext) InstallInVendorRamdisk() bool {
 	return m.module.InstallInVendorRamdisk()
 }
 
+func (m *moduleContext) InstallPathSkipFirstStageRamdisk() bool {
+	return m.module.InstallPathSkipFirstStageRamdisk()
+}
+
+func (m *moduleContext) InstallInVendorKernelRamdisk() bool {
+	return m.module.InstallInVendorKernelRamdisk()
+}
+
 func (m *moduleContext) InstallInDebugRamdisk() bool {
 	return m.module.InstallInDebugRamdisk()
+}
+
+func (m *moduleContext) InstallInTestHarnessRamdisk() bool {
+	return m.module.InstallInTestHarnessRamdisk()
 }
 
 func (m *moduleContext) InstallInRecovery() bool {
@@ -690,6 +694,7 @@ func (m *moduleContext) packageFile(fullInstallPath InstallPath, srcPath Path, e
 		owner:                 owner,
 		requiresFullInstall:   requiresFullInstall,
 		fullInstallPath:       fullInstallPath,
+		installInSanitizerDir: m.InstallInSanitizerDir(),
 		variation:             m.ModuleSubDir(),
 		prebuilt:              IsModulePrebuilt(m, m.Module()),
 	}
@@ -834,20 +839,21 @@ func (m *moduleContext) InstallSymlink(installPath InstallPath, name string, src
 
 	owner, overrides := m.getOwnerAndOverrides()
 	m.packagingSpecs = append(m.packagingSpecs, PackagingSpec{
-		relPathInPackage:    Rel(m, fullInstallPath.PartitionDir(), fullInstallPath.String()),
-		srcPath:             nil,
-		symlinkTarget:       relPath,
-		executable:          false,
-		partition:           fullInstallPath.partition,
-		skipInstall:         m.skipInstall(),
-		aconfigPaths:        uniquelist.Make(m.getAconfigPaths()),
-		archType:            m.target.Arch.ArchType,
-		overrides:           uniquelist.Make(overrides),
-		owner:               owner,
-		requiresFullInstall: m.requiresFullInstall(),
-		fullInstallPath:     fullInstallPath,
-		variation:           m.ModuleSubDir(),
-		prebuilt:            IsModulePrebuilt(m, m.Module()),
+		relPathInPackage:      Rel(m, fullInstallPath.PartitionDir(), fullInstallPath.String()),
+		srcPath:               nil,
+		symlinkTarget:         relPath,
+		executable:            false,
+		partition:             fullInstallPath.partition,
+		skipInstall:           m.skipInstall(),
+		aconfigPaths:          uniquelist.Make(m.getAconfigPaths()),
+		archType:              m.target.Arch.ArchType,
+		overrides:             uniquelist.Make(overrides),
+		owner:                 owner,
+		requiresFullInstall:   m.requiresFullInstall(),
+		fullInstallPath:       fullInstallPath,
+		installInSanitizerDir: m.InstallInSanitizerDir(),
+		variation:             m.ModuleSubDir(),
+		prebuilt:              IsModulePrebuilt(m, m.Module()),
 	})
 
 	return fullInstallPath
@@ -886,20 +892,21 @@ func (m *moduleContext) InstallAbsoluteSymlink(installPath InstallPath, name str
 
 	owner, overrides := m.getOwnerAndOverrides()
 	m.packagingSpecs = append(m.packagingSpecs, PackagingSpec{
-		relPathInPackage:    Rel(m, fullInstallPath.PartitionDir(), fullInstallPath.String()),
-		srcPath:             nil,
-		symlinkTarget:       absPath,
-		executable:          false,
-		partition:           fullInstallPath.partition,
-		skipInstall:         m.skipInstall(),
-		aconfigPaths:        uniquelist.Make(m.getAconfigPaths()),
-		archType:            m.target.Arch.ArchType,
-		overrides:           uniquelist.Make(overrides),
-		owner:               owner,
-		requiresFullInstall: m.requiresFullInstall(),
-		fullInstallPath:     fullInstallPath,
-		variation:           m.ModuleSubDir(),
-		prebuilt:            IsModulePrebuilt(m, m.Module()),
+		relPathInPackage:      Rel(m, fullInstallPath.PartitionDir(), fullInstallPath.String()),
+		srcPath:               nil,
+		symlinkTarget:         absPath,
+		executable:            false,
+		partition:             fullInstallPath.partition,
+		skipInstall:           m.skipInstall(),
+		aconfigPaths:          uniquelist.Make(m.getAconfigPaths()),
+		archType:              m.target.Arch.ArchType,
+		overrides:             uniquelist.Make(overrides),
+		owner:                 owner,
+		requiresFullInstall:   m.requiresFullInstall(),
+		fullInstallPath:       fullInstallPath,
+		installInSanitizerDir: m.InstallInSanitizerDir(),
+		variation:             m.ModuleSubDir(),
+		prebuilt:              IsModulePrebuilt(m, m.Module()),
 	})
 
 	return fullInstallPath
@@ -1089,6 +1096,11 @@ func (c *moduleContext) SetTestSuiteInfo(info TestSuiteInfo) {
 	c.testSuiteInfoSet = true
 }
 
-func (c *moduleContext) FreeModuleAfterGenerateBuildActions() {
-	c.bp.FreeModuleAfterGenerateBuildActions()
+func (m *moduleContext) ModulePhonyFiles(srcPaths ...Path) {
+	for _, srcPath := range srcPaths {
+		if srcPath == nil {
+			panic("ModulePhonyFiles() files cannot be nil")
+		}
+	}
+	m.modulePhonyFiles = append(m.modulePhonyFiles, srcPaths...)
 }
